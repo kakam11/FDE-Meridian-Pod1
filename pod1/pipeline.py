@@ -16,6 +16,7 @@ from typing import Optional
 
 import anthropic
 
+import rules
 from data_loader import (
     load_transactions, load_contract, load_prior_exceptions, load_all_documents,
     get_expense_transactions, get_recurring_exceptions_for_project,
@@ -113,7 +114,7 @@ def _get_client() -> anthropic.Anthropic:
     return anthropic.Anthropic()
 
 
-def _call_claude(system: str, prompt: str, max_tokens: int = 2048) -> str:
+def _call_claude(system: str, prompt: str, max_tokens: int = 8192) -> str:
     client = _get_client()
     with client.messages.stream(
         model="claude-opus-4-8",
@@ -184,6 +185,21 @@ def _classify_exempt(tx: dict, reason: str, note: str) -> dict:
     }
 
 
+def _rule_result_to_dict(rule_result: rules.RuleResult, tx: dict, backup_ref: Optional[str], amount: float) -> dict:
+    return {
+        "transaction_id": tx["transaction_id"],
+        "classification": rule_result.classification,
+        "confidence": rule_result.confidence,
+        "backup_ref": backup_ref,
+        "doc_total_extracted": None,
+        "reimbursable_amount": amount if rule_result.classification == EXEMPT else None,
+        "non_reimbursable_items": rule_result.non_reimbursable_items,
+        "issues": rule_result.issues,
+        "auto_resolution": rule_result.auto_resolution,
+        "analyst_note": rule_result.analyst_note,
+    }
+
+
 def classify_transaction(
     tx: dict,
     doc_content: Optional[str],
@@ -194,70 +210,57 @@ def classify_transaction(
     backup_ref = extract_backup_ref(note)
     amount = float(tx["amount"])
 
-    # Per diem — no receipt required
-    if "per diem" in tx["description"].lower() or "no receipt required (per diem)" in note.lower():
-        return _classify_exempt(tx, "Per diem — no receipt required per contract", note)
+    # Rule engine: deterministic contract checks before Claude
+    rule_result = rules.evaluate(tx, doc_content, contract, prior_resolutions)
+    if rule_result is not None and rule_result.skip_claude:
+        return _rule_result_to_dict(rule_result, tx, backup_ref, amount)
 
-    # Mileage log — no receipt required
-    if tx.get("unit", "").upper() == "MI" and backup_ref and backup_ref.startswith("ML-"):
-        if doc_content:
-            # Still verify mileage log via Claude
-            pass
-        else:
-            return _classify_exempt(tx, "Mileage — mileage log required but not present", note)
+    # Build Claude prompt; if a rule fired with skip_claude=False, inject its findings
+    rule_context = ""
+    if rule_result is not None:
+        rule_context = (
+            f"\n\n## Pre-analysis Rule Engine Findings\n"
+            f"Issues: {'; '.join(rule_result.issues)}\n"
+            f"Suggested action: {rule_result.auto_resolution}"
+        )
 
-    # Under $25 — no receipt required by contract
-    if "under 25" in note.lower() or (not backup_ref and amount < 25 and "no receipt" in note.lower()):
-        return _classify_exempt(tx, f"Under $25 threshold ({amount:.2f}) — receipt not required", note)
-
-    # Receipt explicitly missing
-    if not doc_content and backup_ref:
-        return {
-            "transaction_id": tx["transaction_id"],
-            "classification": MISSING_DOC,
-            "confidence": 0.95,
-            "backup_ref": backup_ref,
-            "doc_total_extracted": None,
-            "reimbursable_amount": None,
-            "non_reimbursable_items": [],
-            "issues": [f"Backup document {backup_ref} referenced but not found in document repository"],
-            "auto_resolution": None,
-            "analyst_note": f"Receipt {backup_ref} missing from repo. Retrieve before billing.",
-        }
-
-    if not doc_content:
-        note_says_missing = "missing" in note.lower()
-        return {
-            "transaction_id": tx["transaction_id"],
-            "classification": FLAG,
-            "confidence": 0.95,
-            "backup_ref": None,
-            "doc_total_extracted": None,
-            "reimbursable_amount": None,
-            "non_reimbursable_items": [],
-            "issues": ["No backup document and no backup reference in transaction note"],
-            "auto_resolution": {
-                "action": "REJECT",
-                "adjusted_amount": 0.0,
-                "reason": "No receipt on file. Per EX-2025-1003: not billable without receipt.",
-                "based_on_prior": "EX-2025-1003",
-            } if note_says_missing else None,
-            "analyst_note": "No receipt available.",
-        }
-
-    # Call Claude for document extraction and classification
     prompt = CLASSIFY_PROMPT.format(
         contract=contract[:3500],
         project_id=PROJECT_ID,
         prior_resolutions=format_prior_resolutions(prior_resolutions),
         transaction=format_transaction(tx),
-        document=doc_content[:4000],
-    )
+        document=(doc_content or "")[:4000],
+    ) + rule_context
+
     try:
         raw = _call_claude(CLASSIFY_SYSTEM, prompt)
         result = _parse_json(raw)
+        # Guard: if Claude's response couldn't be parsed into valid JSON with a
+        # classification key, treat it as unreadable rather than propagating a KeyError
+        if "classification" not in result:
+            parse_error = result.get("raw", raw[:300])
+            return {
+                "transaction_id": tx["transaction_id"],
+                "classification": UNREADABLE,
+                "confidence": 0.0,
+                "backup_ref": backup_ref,
+                "doc_total_extracted": None,
+                "reimbursable_amount": None,
+                "non_reimbursable_items": [],
+                "issues": [f"Claude response could not be parsed into expected JSON. Raw: {parse_error}"],
+                "auto_resolution": None,
+                "analyst_note": "Agent response was malformed — flag for manual review.",
+            }
         result["transaction_id"] = tx["transaction_id"]
         result["backup_ref"] = backup_ref
+        # Merge any rule engine findings into Claude's result
+        if rule_result is not None:
+            result["issues"] = list(dict.fromkeys(rule_result.issues + result.get("issues", [])))
+            result["non_reimbursable_items"] = list(dict.fromkeys(
+                rule_result.non_reimbursable_items + result.get("non_reimbursable_items", [])
+            ))
+            if not result.get("auto_resolution") and rule_result.auto_resolution:
+                result["auto_resolution"] = rule_result.auto_resolution
         return result
     except Exception as e:
         return {
@@ -265,6 +268,9 @@ def classify_transaction(
             "classification": UNREADABLE,
             "confidence": 0.0,
             "backup_ref": backup_ref,
+            "doc_total_extracted": None,
+            "reimbursable_amount": None,
+            "non_reimbursable_items": [],
             "issues": [f"Processing error: {e}"],
             "auto_resolution": None,
             "analyst_note": f"Claude API error: {e}",
@@ -285,7 +291,7 @@ def triage_exception(result: dict, contract: str, prior_resolutions: list[dict])
         analyst_note=result.get("analyst_note", ""),
     )
     try:
-        raw = _call_claude(TRIAGE_SYSTEM, prompt, max_tokens=1024)
+        raw = _call_claude(TRIAGE_SYSTEM, prompt, max_tokens=4096)
         triage = _parse_json(raw)
         return triage
     except Exception as e:
@@ -328,7 +334,7 @@ def run_pipeline(progress_callback=None) -> list[dict]:
         results.append(result)
 
     # Agent 3: triage exceptions (async — runs after classification, non-blocking in UI)
-    flagged = [r for r in results if r["classification"] in (FLAG, MISSING_DOC)]
+    flagged = [r for r in results if r.get("classification") in (FLAG, MISSING_DOC)]
     for i, r in enumerate(flagged):
         if progress_callback:
             progress_callback(total + i, total + len(flagged), f"Triaging {r['transaction_id']}…")
