@@ -14,6 +14,15 @@ from pipeline import (
     run_pipeline, load_results, load_decisions, save_decision, load_audit_trail,
     CLEAN, FLAG, EXEMPT, ORPHAN, UNREADABLE, MISSING_DOC,
 )
+import ruleset_builder
+from data_loader import (
+    save_uploaded_transactions, save_uploaded_contract, save_reference_file,
+    clear_uploaded_transactions, clear_reference_data,
+    get_transactions_source, get_reference_data_summary,
+    UPLOADED_TRANSACTIONS_FILE, UPLOADED_CONTRACT_FILE,
+    load_pm_instructions, load_restricted_docs,
+    CATEGORIES,
+)
 
 # ── Config ───────────────────────────────────────────────────────────────────
 
@@ -53,6 +62,169 @@ def badge(status: str) -> str:
     return f"{STATUS_ICON.get(status, '')} {status}"
 
 
+# ── Tab 0: Setup Ruleset ─────────────────────────────────────────────────────
+
+_CATEGORY_ICON = {
+    "exceptions": "📋",
+    "document": "🧾",
+    "restricted": "🔒",
+    "pm_instructions": "📧",
+}
+
+
+def tab_setup_ruleset():
+    ruleset = ruleset_builder.load_ruleset()
+
+    # ── Status banner ────────────────────────────────────────────────────────
+    if ruleset:
+        built_at = ruleset.get("built_at", "")[:19].replace("T", " ")
+        st.success(
+            f"Ruleset active — built {built_at} UTC  |  "
+            f"Contract: `{ruleset.get('contract_id', '—')}`  |  "
+            f"Project: `{ruleset.get('project_id', '—')}`"
+        )
+        col_caps, col_exc = st.columns(2)
+        with col_caps:
+            caps = ruleset.get("caps", {})
+            if caps:
+                st.subheader("Extracted Caps")
+                st.table(pd.DataFrame(
+                    [{"Rule": k.replace("_", " ").title(), "Value": str(v)} for k, v in caps.items()]
+                ))
+        with col_exc:
+            patterns = ruleset.get("prior_exception_patterns", [])
+            if patterns:
+                st.subheader(f"Exception Patterns ({len(patterns)} recurring)")
+                for p in patterns:
+                    st.markdown(
+                        f"- **{p.get('exception_id', '—')}** · {p.get('exception_type', '')} "
+                        f"→ **{p.get('resolution', '')}**"
+                    )
+            pm_rules = ruleset.get("pm_rules", [])
+            if pm_rules:
+                st.subheader("PM Rules")
+                for r in pm_rules:
+                    st.markdown(f"- {r}")
+
+        # Uploaded reference data summary
+        ref_summary = get_reference_data_summary()
+        if ref_summary:
+            st.subheader("Uploaded Reference Data")
+            st.table(pd.DataFrame([
+                {
+                    "File": r["file"],
+                    "Type": f"{_CATEGORY_ICON.get(r['category'], '')} {r['label']}",
+                }
+                for r in ref_summary
+            ]))
+
+        st.divider()
+        st.caption("Re-upload files below to rebuild with new data.")
+    else:
+        st.info(
+            "No ruleset built yet. Upload the contract and reference data below, "
+            "then click **Build Ruleset**."
+        )
+
+    # ── Upload section ───────────────────────────────────────────────────────
+    st.subheader("1 · Contract")
+    contract_file = st.file_uploader(
+        "Master Services Agreement",
+        type=["md", "txt"],
+        key="setup_contract",
+        help="MSA with billing caps and reimbursement rules (e.g. contract-001.md)",
+    )
+
+    st.subheader("2 · Reference Data")
+    st.caption(
+        "Upload all files used to determine reconciliation confidence: "
+        "prior exceptions (CSV), PM instructions (md/txt), backup documents (RC-*/VI-*/ML-*), "
+        "and restricted reference docs. Files are auto-categorised by name."
+    )
+    ref_files = st.file_uploader(
+        "Reference files",
+        type=["md", "txt", "csv"],
+        accept_multiple_files=True,
+        key="setup_refs",
+        label_visibility="collapsed",
+    )
+
+    # Show live categorisation preview
+    if ref_files:
+        preview_rows = []
+        for f in ref_files:
+            from data_loader import categorize_reference_file
+            cat = categorize_reference_file(f.name)
+            preview_rows.append({
+                "File": f.name,
+                "Detected Type": f"{_CATEGORY_ICON.get(cat, '')} {CATEGORIES[cat]}",
+            })
+        st.table(pd.DataFrame(preview_rows))
+
+    # ── Action buttons ───────────────────────────────────────────────────────
+    contract_ready = contract_file is not None
+    refs_ready = len(ref_files) > 0 if ref_files else False
+
+    col_build, col_reset = st.columns([3, 1])
+
+    with col_build:
+        build_btn = st.button(
+            "⚙ Build Ruleset",
+            type="primary",
+            disabled=not contract_ready,
+            use_container_width=True,
+            help="Contract is required. Reference data is optional but improves confidence.",
+        )
+
+    with col_reset:
+        if ruleset or refs_ready:
+            if st.button("🗑 Reset All", use_container_width=True):
+                ruleset_builder.clear_ruleset()
+                clear_reference_data()
+                st.success("Ruleset and reference data cleared.")
+                st.rerun()
+
+    if build_btn and contract_ready:
+        contract_text = contract_file.read().decode("utf-8")
+        save_uploaded_contract(contract_text)
+
+        exceptions_text = ""
+        pm_text = ""
+        restricted_text = ""
+
+        if ref_files:
+            with st.spinner("Saving reference files…"):
+                for f in ref_files:
+                    content = f.read().decode("utf-8")
+                    save_reference_file(f.name, content)
+                    from data_loader import categorize_reference_file
+                    cat = categorize_reference_file(f.name)
+                    if cat == "exceptions":
+                        exceptions_text += content + "\n"
+                    elif cat == "pm_instructions":
+                        pm_text += f"\n## {f.name}\n\n" + content
+                    elif cat == "restricted":
+                        restricted_text += f"\n## {f.name}\n\n" + content
+
+        with st.spinner("Extracting rules from uploaded data…"):
+            try:
+                result = ruleset_builder.build_ruleset(
+                    contract_text,
+                    exceptions_text,
+                    pm_instructions_text=pm_text,
+                    restricted_docs_text=restricted_text,
+                )
+                n_exc = len(result.get("prior_exception_patterns", []))
+                n_pm = len(result.get("pm_rules", []))
+                st.success(
+                    f"Ruleset built — {n_exc} recurring exception patterns, "
+                    f"{n_pm} PM rules extracted."
+                )
+                st.rerun()
+            except Exception as e:
+                st.error(f"Build failed: {e}")
+
+
 # ── Shared header ─────────────────────────────────────────────────────────────
 
 def render_header():
@@ -73,6 +245,30 @@ def render_header():
 
 def tab_dashboard():
     results = load_results()
+
+    # SAP transactions upload
+    with st.expander("📂 SAP Transactions Data Source", expanded=not bool(UPLOADED_TRANSACTIONS_FILE.exists())):
+        source_label = get_transactions_source()
+        st.caption(f"Active source: **{source_label}**")
+        uploaded = st.file_uploader(
+            "Upload SAP transactions CSV",
+            type=["csv"],
+            key="dashboard_transactions",
+            help="e.g. unbilled-2026-04.csv — SAP unbilled expense transactions",
+        )
+        col_save, col_clear = st.columns([2, 1])
+        with col_save:
+            if uploaded and st.button("💾 Use this file", use_container_width=True):
+                save_uploaded_transactions(uploaded.read().decode("utf-8"))
+                st.success(f"Saved: {uploaded.name}")
+                st.rerun()
+        with col_clear:
+            if UPLOADED_TRANSACTIONS_FILE.exists():
+                if st.button("↩ Revert to sample", use_container_width=True):
+                    clear_uploaded_transactions()
+                    st.rerun()
+
+    st.divider()
 
     # Pipeline control
     col_run, col_status = st.columns([2, 3])
@@ -371,18 +567,21 @@ def main():
     render_header()
     st.divider()
 
-    tabs = st.tabs(["📊 Dashboard", "🚨 Exception Queue", "📋 All Transactions", "📜 Audit Trail"])
+    tabs = st.tabs(["⚙ Setup Ruleset", "📊 Dashboard", "🚨 Exception Queue", "📋 All Transactions", "📜 Audit Trail"])
 
     with tabs[0]:
-        tab_dashboard()
+        tab_setup_ruleset()
 
     with tabs[1]:
-        tab_exceptions()
+        tab_dashboard()
 
     with tabs[2]:
-        tab_all_transactions()
+        tab_exceptions()
 
     with tabs[3]:
+        tab_all_transactions()
+
+    with tabs[4]:
         tab_audit()
 
 
