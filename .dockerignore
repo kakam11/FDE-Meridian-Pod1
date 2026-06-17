@@ -1,0 +1,14 @@
+.git
+.gitignore
+.env
+*.pptx
+pod1/state/
+pod1/__pycache__/
+pod1/*.pyc
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+README.md
+SOLUTION-SUMMARY.md
+RDE-PLAYBOOK-OUTPUT.md
