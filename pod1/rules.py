@@ -9,9 +9,37 @@ Claude to do line-level verification — the rule's findings are merged into the
 Evaluation: rules run in order; first match wins.
 """
 
+import json
 import re
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
+
+_RULESET_FILE = Path(__file__).parent / "state" / "ruleset.json"
+
+
+def _get_ruleset() -> Optional[dict]:
+    """Load ruleset from file if it exists. No caching — file is small."""
+    if _RULESET_FILE.exists():
+        try:
+            return json.loads(_RULESET_FILE.read_text())
+        except Exception:
+            pass
+    return None
+
+
+def _cap(name: str, default: float) -> float:
+    rs = _get_ruleset()
+    if rs:
+        return float(rs.get("caps", {}).get(name, default))
+    return default
+
+
+def _terms(name: str, default: list) -> list:
+    rs = _get_ruleset()
+    if rs:
+        return rs.get(name, default)
+    return default
 
 # Classification constants (mirrors pipeline.py — no import to avoid circular dep)
 CLEAN = "CLEAN"
@@ -58,11 +86,12 @@ class RuleResult:
 # ── Pre-document rules (no doc_content needed) ──────────────────────────────
 
 def rule_per_diem(tx: dict, doc_content, contract, prior_resolutions) -> Optional[RuleResult]:
-    """Per diem: $65/day flat rate, no receipt required per contract §4."""
+    """Per diem: flat rate no receipt required per contract §4."""
     desc = tx.get("description", "").lower()
     note = tx.get("note", "").lower()
     if "per diem" in desc or "no receipt required (per diem)" in note:
         amount = float(tx.get("amount", 0))
+        rate = _cap("per_diem_usd", PER_DIEM_USD)
         return RuleResult(
             classification=EXEMPT,
             confidence=1.0,
@@ -70,7 +99,7 @@ def rule_per_diem(tx: dict, doc_content, contract, prior_resolutions) -> Optiona
             auto_resolution={
                 "action": "APPROVE",
                 "adjusted_amount": amount,
-                "reason": f"Per diem ${PER_DIEM_USD:.0f}/day — no receipt required per contract §4",
+                "reason": f"Per diem ${rate:.0f}/day — no receipt required per contract §4",
                 "based_on_prior": None,
             },
             analyst_note="Per diem — auto-approved per contract §4.",
@@ -79,22 +108,23 @@ def rule_per_diem(tx: dict, doc_content, contract, prior_resolutions) -> Optiona
 
 
 def rule_under_threshold(tx: dict, doc_content, contract, prior_resolutions) -> Optional[RuleResult]:
-    """Expenses under $25 do not require a receipt per contract §4."""
+    """Expenses under the receipt threshold do not require a receipt per contract §4."""
     note = tx.get("note", "").lower()
     amount = float(tx.get("amount", 0))
     backup_ref = _extract_ref(tx.get("note", ""))
-    if amount < RECEIPT_THRESHOLD_USD and not backup_ref and "no receipt" in note:
+    threshold = _cap("receipt_threshold_usd", RECEIPT_THRESHOLD_USD)
+    if amount < threshold and not backup_ref and "no receipt" in note:
         return RuleResult(
             classification=EXEMPT,
             confidence=1.0,
-            issues=[f"Under ${RECEIPT_THRESHOLD_USD:.0f} threshold — receipt not required per contract §4"],
+            issues=[f"Under ${threshold:.0f} threshold — receipt not required per contract §4"],
             auto_resolution={
                 "action": "APPROVE",
                 "adjusted_amount": amount,
-                "reason": f"Under ${RECEIPT_THRESHOLD_USD:.0f} — no receipt required per contract §4",
+                "reason": f"Under ${threshold:.0f} — no receipt required per contract §4",
                 "based_on_prior": None,
             },
-            analyst_note=f"Under ${RECEIPT_THRESHOLD_USD:.0f} threshold — auto-approved.",
+            analyst_note=f"Under ${threshold:.0f} threshold — auto-approved.",
         )
     return None
 
@@ -117,7 +147,7 @@ def rule_no_receipt_no_ref(tx: dict, doc_content, contract, prior_resolutions) -
     backup_ref = _extract_ref(tx.get("note", ""))
     amount = float(tx.get("amount", 0))
     note = tx.get("note", "")
-    if not backup_ref and not doc_content and amount >= RECEIPT_THRESHOLD_USD:
+    if not backup_ref and not doc_content and amount >= _cap("receipt_threshold_usd", RECEIPT_THRESHOLD_USD):
         note_says_missing = "missing" in note.lower()
         return RuleResult(
             classification=FLAG,
@@ -146,7 +176,7 @@ def rule_alcohol(tx: dict, doc_content, contract, prior_resolutions) -> Optional
     """Alcohol is not reimbursable under any circumstance per contract §4."""
     if not doc_content:
         return None
-    found = _word_match(ALCOHOL_TERMS, doc_content)
+    found = _word_match(_terms("alcohol_terms", ALCOHOL_TERMS), doc_content)
     if not found:
         return None
     items = _extract_alcohol_lines(doc_content)
@@ -169,7 +199,7 @@ def rule_alcohol(tx: dict, doc_content, contract, prior_resolutions) -> Optional
 def rule_personal_items(tx: dict, doc_content, contract, prior_resolutions) -> Optional[RuleResult]:
     """Personal items are not reimbursable per contract §4."""
     sources = " ".join(filter(None, [doc_content or "", tx.get("description", "")]))
-    found = _word_match(PERSONAL_TERMS, sources)
+    found = _word_match(_terms("personal_terms", PERSONAL_TERMS), sources)
     if not found:
         return None
     return RuleResult(
@@ -193,22 +223,24 @@ def rule_subcontractor_markup(tx: dict, doc_content, contract, prior_resolutions
     backup_ref = _extract_ref(tx.get("note", ""))
     if not (backup_ref and backup_ref.startswith("VI-")):
         return None
+    markup_pct = _cap("subcontractor_markup_pct", SUBCONTRACTOR_MARKUP_PCT)
     markup_mentioned = any(kw in (doc_content + tx.get("note", "")).lower() for kw in ["markup", "+8%", "8%", "plus 8"])
     if not markup_mentioned:
         amount = float(tx.get("amount", 0))
-        adjusted = round(amount * (1 + SUBCONTRACTOR_MARKUP_PCT), 2)
+        adjusted = round(amount * (1 + markup_pct), 2)
+        pct_display = f"{markup_pct * 100:.0f}%"
         return RuleResult(
             classification=FLAG,
             confidence=0.90,
-            issues=["Subcontractor invoice — 8% markup required per contract §3 may not be applied"],
+            issues=[f"Subcontractor invoice — {pct_display} markup required per contract §3 may not be applied"],
             auto_resolution={
                 "action": "ADJUST",
                 "adjusted_amount": adjusted,
-                "reason": f"Apply 8% markup per contract §3. ${amount:.2f} → ${adjusted:.2f}. Per EX-2025-1129.",
+                "reason": f"Apply {pct_display} markup per contract §3. ${amount:.2f} → ${adjusted:.2f}. Per EX-2025-1129.",
                 "based_on_prior": "EX-2025-1129",
             },
-            analyst_note=f"Subcontractor markup check: ${amount:.2f} should be ${adjusted:.2f} (+8%).",
-            skip_claude=False,  # Claude verifies the invoice amounts
+            analyst_note=f"Subcontractor markup check: ${amount:.2f} should be ${adjusted:.2f} (+{pct_display}).",
+            skip_claude=False,
         )
     return None
 
@@ -245,12 +277,13 @@ def rule_meal_cap(tx: dict, doc_content, contract, prior_resolutions) -> Optiona
     if not any(kw in tx.get("description", "").lower() for kw in MEAL_TERMS):
         return None
     amount = float(tx.get("amount", 0))
-    if amount > MEAL_CAP_USD:
+    meal_cap = _cap("meal_per_day_usd", MEAL_CAP_USD)
+    if amount > meal_cap:
         return RuleResult(
             classification=FLAG,
             confidence=0.88,
-            issues=[f"Meal expense ${amount:.2f} exceeds ${MEAL_CAP_USD:.0f}/day cap per contract §4"],
-            analyst_note=f"Meal over cap: ${amount:.2f} vs ${MEAL_CAP_USD:.0f} limit. Check for PL approval.",
+            issues=[f"Meal expense ${amount:.2f} exceeds ${meal_cap:.0f}/day cap per contract §4"],
+            analyst_note=f"Meal over cap: ${amount:.2f} vs ${meal_cap:.0f} limit. Check for PL approval.",
             skip_claude=False,
         )
     return None
@@ -263,14 +296,15 @@ def rule_lodging_cap(tx: dict, doc_content, contract, prior_resolutions) -> Opti
     if not any(kw in tx.get("description", "").lower() for kw in LODGING_TERMS):
         return None
     amount = float(tx.get("amount", 0))
-    if amount <= LODGING_CAP_MAJOR_METRO_USD:
+    lodging_cap = _cap("lodging_major_metro_usd", LODGING_CAP_MAJOR_METRO_USD)
+    if amount <= lodging_cap:
         return None
     is_coastal = any(kw in doc_content.lower() for kw in ["coastal", "point b", "site b"])
     if is_coastal:
         return RuleResult(
             classification=FLAG,
             confidence=0.90,
-            issues=[f"Lodging ${amount:.2f}/night exceeds ${LODGING_CAP_MAJOR_METRO_USD:.0f} cap — coastal site"],
+            issues=[f"Lodging ${amount:.2f}/night exceeds ${lodging_cap:.0f} cap — coastal site"],
             auto_resolution={
                 "action": "APPROVE",
                 "adjusted_amount": amount,
@@ -283,10 +317,98 @@ def rule_lodging_cap(tx: dict, doc_content, contract, prior_resolutions) -> Opti
     return RuleResult(
         classification=FLAG,
         confidence=0.90,
-        issues=[f"Lodging ${amount:.2f}/night exceeds ${LODGING_CAP_MAJOR_METRO_USD:.0f} major metro cap per contract §4"],
-        analyst_note=f"Lodging over cap — obtain PL approval or adjust to ${LODGING_CAP_MAJOR_METRO_USD:.0f}.",
+        issues=[f"Lodging ${amount:.2f}/night exceeds ${lodging_cap:.0f} major metro cap per contract §4"],
+        analyst_note=f"Lodging over cap — obtain PL approval or adjust to ${lodging_cap:.0f}.",
         skip_claude=False,
     )
+
+
+# ── Ruleset pattern matching rule ────────────────────────────────────────────
+
+_KEYWORD_STOP = {
+    "the", "this", "that", "with", "from", "have", "been", "will", "not",
+    "and", "but", "for", "per", "are", "was", "has", "had", "its", "over",
+    "under", "into", "than", "such", "each", "more", "site", "cost", "rate",
+    "date", "item", "type", "code", "name", "amount", "total", "also",
+    "when", "then", "does", "did",
+    # Generic financial/document terms that appear in nearly every transaction or receipt —
+    # keeping them in would cause false positives on every document.
+    "expense", "expenses", "receipt", "receipts", "charge", "charges",
+    "invoice", "invoices", "payment", "payments", "document", "documents",
+    "received", "produced", "applied", "appears", "appearing", "threshold",
+    "billed", "billing", "contract", "project", "client", "standard",
+}
+
+
+def _extract_keywords(text: str) -> list[str]:
+    """Extract meaningful tokens from pattern description or exception type for fuzzy matching."""
+    words = re.findall(r'\b[a-z][a-z]{2,}\b', text.lower())
+    return [w for w in words if w not in _KEYWORD_STOP]
+
+
+def rule_prior_exception_patterns(tx: dict, doc_content, _contract, _prior_resolutions) -> Optional[RuleResult]:
+    """Match transaction against prior exception patterns extracted into ruleset.json by the Setup phase."""
+    rs = _get_ruleset()
+    if not rs:
+        return None
+    patterns = rs.get("prior_exception_patterns", [])
+    if not patterns:
+        return None
+
+    # Build a single text corpus from the transaction (+ doc when available)
+    tx_corpus = " ".join(filter(None, [
+        tx.get("description", ""),
+        tx.get("note", ""),
+        doc_content or "",
+    ])).lower()
+
+    for pattern in patterns:
+        if not pattern.get("recurring"):
+            continue
+        # Skip "no receipt / missing document" patterns when we DO have a backup document —
+        # those scenarios are already handled deterministically by rule_missing_doc /
+        # rule_no_receipt_no_ref before this rule ever runs.
+        exc_type = pattern.get("exception_type", "").upper()
+        if doc_content and any(tok in exc_type for tok in ("MISSING", "NO_RECEIPT", "RECEIPT")):
+            continue
+        raw_text = f"{pattern.get('exception_type', '')} {pattern.get('pattern_description', '')}"
+        keywords = _extract_keywords(raw_text)
+        # Deduplicate while preserving order
+        seen: set[str] = set()
+        unique_kw = [k for k in keywords if not (k in seen or seen.add(k))]  # type: ignore[func-returns-value]
+        # Need at least 2 distinctive keywords to match reliably; 1-keyword patterns
+        # are too generic and produce false positives.
+        if len(unique_kw) < 2:
+            continue
+        matched = [kw for kw in unique_kw if re.search(r'\b' + re.escape(kw) + r'\b', tx_corpus)]
+        # Require at least 2 keyword hits regardless of pattern length
+        if len(matched) < 2:
+            continue
+
+        resolution = pattern.get("resolution", "ESCALATE").upper()
+        action = resolution if resolution in ("APPROVE", "REJECT", "ADJUST", "ESCALATE") else "ESCALATE"
+        classification = EXEMPT if action == "APPROVE" else FLAG
+
+        return RuleResult(
+            classification=classification,
+            confidence=0.82,
+            issues=[
+                f"Matches prior exception pattern {pattern.get('exception_id', '?')}: "
+                f"{pattern.get('pattern_description', raw_text)}"
+            ],
+            auto_resolution={
+                "action": action,
+                "adjusted_amount": None,
+                "reason": pattern.get("reason", "Recurring exception — see prior resolution."),
+                "based_on_prior": pattern.get("exception_id"),
+            },
+            analyst_note=(
+                f"Prior pattern match [{pattern.get('exception_id')}] "
+                f"keywords: {', '.join(matched)}. Claude verifying."
+            ),
+            skip_claude=False,  # Always let Claude verify fuzzy pattern matches
+        )
+    return None
 
 
 # ── Rule registry ────────────────────────────────────────────────────────────
@@ -313,6 +435,12 @@ def evaluate(tx: dict, doc_content: Optional[str], contract: str, prior_resoluti
     Run all rules. Returns first RuleResult match or None (escalate to Claude).
     skip_claude=True  → return result directly, no Claude call.
     skip_claude=False → pass result context to Claude, merge findings.
+
+    Order:
+      1. PRE_DOC_RULES  — deterministic, no document needed (per diem, missing doc, etc.)
+      2. POST_DOC_RULES — require doc_content (alcohol, caps, markup, etc.)
+      3. rule_prior_exception_patterns — ruleset-driven fuzzy match; runs last so hardcoded
+         rules always take priority, but extracted patterns still catch residual cases.
     """
     for rule in PRE_DOC_RULES:
         result = rule(tx, doc_content, contract, prior_resolutions)
@@ -323,7 +451,8 @@ def evaluate(tx: dict, doc_content: Optional[str], contract: str, prior_resoluti
             result = rule(tx, doc_content, contract, prior_resolutions)
             if result is not None:
                 return result
-    return None
+    # Pattern matching runs regardless of doc presence — uses whatever corpus is available
+    return rule_prior_exception_patterns(tx, doc_content, contract, prior_resolutions)
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────

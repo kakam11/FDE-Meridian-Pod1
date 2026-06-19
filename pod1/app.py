@@ -4,6 +4,7 @@ Project: PRJ-NS-7421 · Northstar Civic Group · Cycle 2026-04
 """
 
 import sys
+import time as _time
 from pathlib import Path
 import streamlit as st
 import pandas as pd
@@ -11,8 +12,17 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).parent))
 
 from pipeline import (
-    run_pipeline, load_results, load_decisions, save_decision, load_audit_trail,
+    run_pipeline, load_results, load_decisions, save_decision, clear_decisions, load_audit_trail,
     CLEAN, FLAG, EXEMPT, ORPHAN, UNREADABLE, MISSING_DOC,
+)
+import ruleset_builder
+from data_loader import (
+    save_uploaded_transactions, save_uploaded_contract, save_reference_file,
+    clear_uploaded_transactions, clear_reference_data,
+    get_transactions_source, get_reference_data_summary,
+    UPLOADED_TRANSACTIONS_FILE, UPLOADED_CONTRACT_FILE,
+    load_pm_instructions, load_restricted_docs,
+    CATEGORIES,
 )
 
 # ── Config ───────────────────────────────────────────────────────────────────
@@ -53,6 +63,169 @@ def badge(status: str) -> str:
     return f"{STATUS_ICON.get(status, '')} {status}"
 
 
+# ── Tab 0: Setup Ruleset ─────────────────────────────────────────────────────
+
+_CATEGORY_ICON = {
+    "exceptions": "📋",
+    "document": "🧾",
+    "restricted": "🔒",
+    "pm_instructions": "📧",
+}
+
+
+def tab_setup_ruleset():
+    ruleset = ruleset_builder.load_ruleset()
+
+    # ── Status banner ────────────────────────────────────────────────────────
+    if ruleset:
+        built_at = ruleset.get("built_at", "")[:19].replace("T", " ")
+        st.success(
+            f"Ruleset active — built {built_at} UTC  |  "
+            f"Contract: `{ruleset.get('contract_id', '—')}`  |  "
+            f"Project: `{ruleset.get('project_id', '—')}`"
+        )
+        col_caps, col_exc = st.columns(2)
+        with col_caps:
+            caps = ruleset.get("caps", {})
+            if caps:
+                st.subheader("Extracted Caps")
+                st.table(pd.DataFrame(
+                    [{"Rule": k.replace("_", " ").title(), "Value": str(v)} for k, v in caps.items()]
+                ))
+        with col_exc:
+            patterns = ruleset.get("prior_exception_patterns", [])
+            if patterns:
+                st.subheader(f"Exception Patterns ({len(patterns)} recurring)")
+                for p in patterns:
+                    st.markdown(
+                        f"- **{p.get('exception_id', '—')}** · {p.get('exception_type', '')} "
+                        f"→ **{p.get('resolution', '')}**"
+                    )
+            pm_rules = ruleset.get("pm_rules", [])
+            if pm_rules:
+                st.subheader("PM Rules")
+                for r in pm_rules:
+                    st.markdown(f"- {r}")
+
+        # Uploaded reference data summary
+        ref_summary = get_reference_data_summary()
+        if ref_summary:
+            st.subheader("Uploaded Reference Data")
+            st.table(pd.DataFrame([
+                {
+                    "File": r["file"],
+                    "Type": f"{_CATEGORY_ICON.get(r['category'], '')} {r['label']}",
+                }
+                for r in ref_summary
+            ]))
+
+        st.divider()
+        st.caption("Re-upload files below to rebuild with new data.")
+    else:
+        st.info(
+            "No ruleset built yet. Upload the contract and reference data below, "
+            "then click **Build Ruleset**."
+        )
+
+    # ── Upload section ───────────────────────────────────────────────────────
+    st.subheader("1 · Contract")
+    contract_file = st.file_uploader(
+        "Master Services Agreement",
+        type=["md", "txt"],
+        key="setup_contract",
+        help="MSA with billing caps and reimbursement rules (e.g. contract-001.md)",
+    )
+
+    st.subheader("2 · Reference Data")
+    st.caption(
+        "Upload all files used to determine reconciliation confidence: "
+        "prior exceptions (CSV), PM instructions (md/txt), backup documents (RC-*/VI-*/ML-*), "
+        "and restricted reference docs. Files are auto-categorised by name."
+    )
+    ref_files = st.file_uploader(
+        "Reference files",
+        type=["md", "txt", "csv"],
+        accept_multiple_files=True,
+        key="setup_refs",
+        label_visibility="collapsed",
+    )
+
+    # Show live categorisation preview
+    if ref_files:
+        preview_rows = []
+        for f in ref_files:
+            from data_loader import categorize_reference_file
+            cat = categorize_reference_file(f.name)
+            preview_rows.append({
+                "File": f.name,
+                "Detected Type": f"{_CATEGORY_ICON.get(cat, '')} {CATEGORIES[cat]}",
+            })
+        st.table(pd.DataFrame(preview_rows))
+
+    # ── Action buttons ───────────────────────────────────────────────────────
+    contract_ready = contract_file is not None
+    refs_ready = len(ref_files) > 0 if ref_files else False
+
+    col_build, col_reset = st.columns([3, 1])
+
+    with col_build:
+        build_btn = st.button(
+            "⚙ Build Ruleset",
+            type="primary",
+            disabled=not contract_ready,
+            use_container_width=True,
+            help="Contract is required. Reference data is optional but improves confidence.",
+        )
+
+    with col_reset:
+        if ruleset or refs_ready:
+            if st.button("🗑 Reset All", use_container_width=True):
+                ruleset_builder.clear_ruleset()
+                clear_reference_data()
+                st.success("Ruleset and reference data cleared.")
+                st.rerun()
+
+    if build_btn and contract_ready:
+        contract_text = contract_file.read().decode("utf-8")
+        save_uploaded_contract(contract_text)
+
+        exceptions_text = ""
+        pm_text = ""
+        restricted_text = ""
+
+        if ref_files:
+            with st.spinner("Saving reference files…"):
+                for f in ref_files:
+                    content = f.read().decode("utf-8")
+                    save_reference_file(f.name, content)
+                    from data_loader import categorize_reference_file
+                    cat = categorize_reference_file(f.name)
+                    if cat == "exceptions":
+                        exceptions_text += content + "\n"
+                    elif cat == "pm_instructions":
+                        pm_text += f"\n## {f.name}\n\n" + content
+                    elif cat == "restricted":
+                        restricted_text += f"\n## {f.name}\n\n" + content
+
+        with st.spinner("Extracting rules from uploaded data…"):
+            try:
+                result = ruleset_builder.build_ruleset(
+                    contract_text,
+                    exceptions_text,
+                    pm_instructions_text=pm_text,
+                    restricted_docs_text=restricted_text,
+                )
+                n_exc = len(result.get("prior_exception_patterns", []))
+                n_pm = len(result.get("pm_rules", []))
+                st.success(
+                    f"Ruleset built — {n_exc} recurring exception patterns, "
+                    f"{n_pm} PM rules extracted."
+                )
+                st.rerun()
+            except Exception as e:
+                st.error(f"Build failed: {e}")
+
+
 # ── Shared header ─────────────────────────────────────────────────────────────
 
 def render_header():
@@ -74,22 +247,102 @@ def render_header():
 def tab_dashboard():
     results = load_results()
 
-    # Pipeline control
-    col_run, col_status = st.columns([2, 3])
-    with col_run:
-        run_btn = st.button("▶ Run Reconciliation Pipeline", type="primary", use_container_width=True)
+    # SAP transactions upload
+    with st.expander("📂 SAP Transactions Data Source", expanded=not bool(UPLOADED_TRANSACTIONS_FILE.exists())):
+        source_label = get_transactions_source()
+        st.caption(f"Active source: **{source_label}**")
+        uploaded = st.file_uploader(
+            "Upload SAP transactions CSV",
+            type=["csv"],
+            key="dashboard_transactions",
+            help="e.g. unbilled-2026-04.csv — SAP unbilled expense transactions",
+        )
+        col_save, col_clear = st.columns([2, 1])
+        with col_save:
+            if uploaded and st.button("💾 Use this file", use_container_width=True):
+                save_uploaded_transactions(uploaded.read().decode("utf-8"))
+                st.success(f"Saved: {uploaded.name}")
+                st.rerun()
+        with col_clear:
+            if UPLOADED_TRANSACTIONS_FILE.exists():
+                if st.button("↩ Revert to sample", use_container_width=True):
+                    clear_uploaded_transactions()
+                    st.rerun()
+
+    st.divider()
+
+    run_btn = st.button("▶ Run Reconciliation Pipeline", type="primary")
 
     if run_btn:
-        progress_bar = col_status.progress(0, text="Starting pipeline…")
+        # ── Progress UI ──────────────────────────────────────────────────────
+        col_cls, col_tri = st.columns(2)
+        with col_cls:
+            st.caption("📊 Classification")
+            cls_bar   = st.progress(0.0)
+            cls_label = st.empty()
+        with col_tri:
+            st.caption("🔍 Triage")
+            tri_bar   = st.progress(0.0)
+            tri_label = st.empty()
+        countdown_el = st.empty()
 
-        def on_progress(step, total, msg):
-            pct = min(int(step / max(total, 1) * 100), 99)
-            progress_bar.progress(pct, text=msg)
+        _s = {
+            "cls_total": 0, "cls_done": 0,
+            "tri_total": 0, "tri_done": 0,
+            "start":       _time.time(),
+            "tri_start":   None,
+        }
+
+        def _fmt(secs: float) -> str:
+            secs = max(0, int(secs))
+            m, s = divmod(secs, 60)
+            return f"{m}m {s:02d}s" if m else f"{s}s"
+
+        def on_progress(step: int, total: int, _msg: str, phase: str = "classify"):
+            now     = _time.time()
+            elapsed = now - _s["start"]
+            done    = step + 1
+            pending = total - done
+
+            if phase == "classify":
+                _s["cls_total"] = total
+                _s["cls_done"]  = done
+                cls_bar.progress(done / max(total, 1))
+                cls_label.markdown(
+                    f"✅ **{done}** done &nbsp;·&nbsp; "
+                    f"⏳ **{pending}** pending &nbsp;·&nbsp; total **{total}**"
+                )
+                if done > 1:
+                    rate      = elapsed / done          # secs per classify step
+                    rem_cls   = pending * rate
+                    est_tri   = total * 0.35 * rate * 0.7  # ~35% flagged, triage faster
+                    countdown_el.info(f"⏱ Est. **{_fmt(rem_cls + est_tri)}** remaining")
+
+            elif phase == "triage":
+                if _s["tri_start"] is None:
+                    _s["tri_start"] = now
+                _s["tri_total"] = total
+                _s["tri_done"]  = done
+                tri_bar.progress(done / max(total, 1))
+                tri_label.markdown(
+                    f"✅ **{done}** done &nbsp;·&nbsp; "
+                    f"⏳ **{pending}** pending &nbsp;·&nbsp; total **{total}**"
+                )
+                tri_elapsed = now - _s["tri_start"]
+                if done > 0:
+                    rate = tri_elapsed / done
+                    countdown_el.info(f"⏱ Est. **{_fmt(pending * rate)}** remaining (triage)")
 
         try:
             results = run_pipeline(progress_callback=on_progress)
-            progress_bar.progress(100, text="Pipeline complete.")
-            st.success(f"Processed {len(results)} items.")
+            cls_bar.progress(1.0)
+            tri_bar.progress(1.0)
+            cls_label.markdown(f"✅ **{_s['cls_total']}** classified &nbsp;·&nbsp; 🏁 complete")
+            tri_label.markdown(
+                f"✅ **{_s['tri_total']}** triaged &nbsp;·&nbsp; 🏁 complete"
+                if _s["tri_total"] else "— no exceptions to triage"
+            )
+            countdown_el.success(f"✅ Pipeline complete — {len(results)} items processed.")
             st.rerun()
         except Exception as e:
             st.error(f"Pipeline error: {e}")
@@ -251,10 +504,15 @@ def tab_exceptions():
     pending = [r for r in flagged if r["transaction_id"] not in decided_ids]
     reviewed = [r for r in flagged if r["transaction_id"] in decided_ids]
 
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns([2, 2, 2, 1])
     c1.metric("Total Exceptions", len(flagged))
     c2.metric("Pending Review", len(pending))
     c3.metric("Reviewed", len(reviewed))
+    with c4:
+        if reviewed and st.button("🗑 Reset Decisions", use_container_width=True, help="Clear all analyst decisions — action is logged to audit trail"):
+            clear_decisions()
+            st.success("All decisions cleared.")
+            st.rerun()
 
     st.divider()
 
@@ -365,24 +623,183 @@ def tab_audit():
             st.markdown(f"`{ts} UTC` **{etype}**")
 
 
+# ── Tab 5: KPI & Savings ─────────────────────────────────────────────────────
+
+def tab_kpi():
+    results = load_results()
+    if not results:
+        st.info("Run the pipeline first (Dashboard tab).")
+        return
+
+    # ── Metrics from this run ─────────────────────────────────────────────────
+    total_run = len(results)
+    n_clean   = sum(1 for r in results if r["classification"] == CLEAN)
+    n_exempt  = sum(1 for r in results if r["classification"] == EXEMPT)
+    n_flag    = sum(1 for r in results if r["classification"] in (FLAG, MISSING_DOC, ORPHAN, UNREADABLE))
+    n_auto    = sum(
+        1 for r in results
+        if r["classification"] not in (CLEAN, EXEMPT)
+        and (r.get("auto_resolution") or (r.get("triage") or {}).get("auto_resolvable"))
+    )
+    n_manual  = n_flag - n_auto
+    avg_conf  = sum(r.get("confidence", 0) for r in results) / max(total_run, 1)
+
+    auto_clear_rate = (n_clean + n_exempt) / max(total_run, 1)
+    auto_res_rate   = n_auto / max(n_flag, 1)
+    manual_rate     = n_manual / max(total_run, 1)
+    auto_res_of_all = n_auto / max(total_run, 1)
+
+    # ── Baseline assumptions ──────────────────────────────────────────────────
+    MONTHLY_VOL      = 20_000
+    ANALYST_COUNT    = 200
+    ANALYST_RATE     = 85       # USD loaded cost / hr
+    MANUAL_MINS      = 45       # avg mins per invoice, manual end-to-end
+    WORKING_HRS_MO   = 160      # hrs per analyst per month
+
+    MIN_SPOT_CHECK   = 1.5      # auto-cleared: QC glance only
+    MIN_CONFIRM      = 8.0      # agent-suggested: analyst confirms
+    MIN_FULL_REVIEW  = 28.0     # no suggestion: analyst investigates
+
+    # ── Manual baseline ───────────────────────────────────────────────────────
+    manual_hrs  = MONTHLY_VOL * MANUAL_MINS / 60
+    manual_cost = manual_hrs * ANALYST_RATE
+    manual_ftes = manual_hrs / WORKING_HRS_MO
+
+    # ── Agent-assisted projection ─────────────────────────────────────────────
+    agent_hrs = MONTHLY_VOL * (
+        auto_clear_rate * MIN_SPOT_CHECK +
+        auto_res_of_all * MIN_CONFIRM +
+        manual_rate     * MIN_FULL_REVIEW
+    ) / 60
+    agent_cost = agent_hrs * ANALYST_RATE
+    agent_ftes = agent_hrs / WORKING_HRS_MO
+
+    hrs_saved   = manual_hrs  - agent_hrs
+    cost_saved  = manual_cost - agent_cost
+    ftes_freed  = manual_ftes - agent_ftes
+    speed_mult  = manual_hrs  / max(agent_hrs, 1)
+
+    # ── Section 1: headline KPIs ──────────────────────────────────────────────
+    st.subheader("Projected Monthly Impact — 20,000 invoices · 200 analysts")
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Analyst Hours Saved",  f"{hrs_saved:,.0f} hrs",
+              delta=f"−{hrs_saved / manual_hrs * 100:.0f}% vs manual")
+    k2.metric("Cost Savings",         f"${cost_saved:,.0f} / mo",
+              delta=f"−{cost_saved / manual_cost * 100:.0f}% vs manual")
+    k3.metric("FTEs Redeployable",    f"{ftes_freed:.0f}",
+              delta=f"of {manual_ftes:.0f} billing FTEs")
+    k4.metric("Throughput Multiplier", f"{speed_mult:.1f}×",
+              delta="faster than current process")
+
+    st.divider()
+
+    # ── Section 2: this run ───────────────────────────────────────────────────
+    st.subheader(f"This Pipeline Run — {total_run} transactions")
+    r1, r2, r3, r4 = st.columns(4)
+    r1.metric("Auto-cleared",            f"{n_clean + n_exempt} / {total_run}",
+              delta=f"{auto_clear_rate * 100:.0f}%  — zero analyst time")
+    r2.metric("Auto-resolved exceptions", f"{n_auto} / {n_flag}",
+              delta=f"{auto_res_rate * 100:.0f}% of flagged items")
+    r3.metric("Needs manual review",      f"{n_manual} / {total_run}",
+              delta=f"{manual_rate * 100:.0f}% of transactions")
+    r4.metric("Avg agent confidence",     f"{avg_conf * 100:.0f}%")
+
+    st.divider()
+
+    # ── Section 3: charts ─────────────────────────────────────────────────────
+    col_left, col_right = st.columns(2)
+
+    with col_left:
+        st.subheader("Monthly Analyst Hours")
+        st.caption("Manual process vs agent-assisted — breakdown by work type")
+        hrs_df = pd.DataFrame(
+            {
+                "Auto-cleared (spot check)": [
+                    MONTHLY_VOL * auto_clear_rate * MANUAL_MINS / 60,
+                    MONTHLY_VOL * auto_clear_rate * MIN_SPOT_CHECK / 60,
+                ],
+                "Agent-suggested (confirm)": [
+                    MONTHLY_VOL * auto_res_of_all * MANUAL_MINS / 60,
+                    MONTHLY_VOL * auto_res_of_all * MIN_CONFIRM / 60,
+                ],
+                "Full manual review": [
+                    MONTHLY_VOL * manual_rate * MANUAL_MINS / 60,
+                    MONTHLY_VOL * manual_rate * MIN_FULL_REVIEW / 60,
+                ],
+            },
+            index=["Manual Process", "Agent-Assisted"],
+        )
+        st.bar_chart(hrs_df, use_container_width=True)
+        st.caption(
+            f"Manual total: **{manual_hrs:,.0f} hrs/mo** &nbsp;→&nbsp; "
+            f"Agent total: **{agent_hrs:,.0f} hrs/mo**"
+        )
+
+    with col_right:
+        st.subheader("Invoice Disposition")
+        st.caption(f"From this run — extrapolated to {MONTHLY_VOL:,} monthly invoices")
+        disp_df = pd.DataFrame(
+            {"Invoices": [
+                round(MONTHLY_VOL * n_clean   / max(total_run, 1)),
+                round(MONTHLY_VOL * n_exempt  / max(total_run, 1)),
+                round(MONTHLY_VOL * n_auto    / max(total_run, 1)),
+                round(MONTHLY_VOL * n_manual  / max(total_run, 1)),
+            ]},
+            index=["✅ CLEAN", "⚡ EXEMPT", "🤖 Auto-resolved", "👤 Manual review"],
+        )
+        st.bar_chart(disp_df, use_container_width=True)
+        st.caption(
+            f"Manual review queue shrinks from **{MONTHLY_VOL:,}** to "
+            f"**{round(MONTHLY_VOL * manual_rate):,}** invoices/mo"
+        )
+
+    st.divider()
+
+    # ── Section 4: assumptions ────────────────────────────────────────────────
+    with st.expander("📋 Assumptions used in projection"):
+        st.markdown(f"""
+| Parameter | Value |
+|---|---|
+| Monthly invoice volume | {MONTHLY_VOL:,} |
+| Current billing analysts | {ANALYST_COUNT} |
+| Manual review time per invoice | {MANUAL_MINS} min |
+| Analyst loaded cost | ${ANALYST_RATE}/hr |
+| Working hours per analyst per month | {WORKING_HRS_MO} hrs |
+| Agent — auto-cleared (spot check) | {MIN_SPOT_CHECK} min |
+| Agent — exception confirmation | {MIN_CONFIRM} min |
+| Agent — full manual investigation | {MIN_FULL_REVIEW} min |
+        """)
+        st.caption(
+            "Auto-clear rate, auto-resolution rate, and manual rate are derived from this pipeline run "
+            f"({total_run} transactions) and applied to the full monthly volume. "
+            "Actual savings will vary based on contract complexity and exception volume."
+        )
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
     render_header()
     st.divider()
 
-    tabs = st.tabs(["📊 Dashboard", "🚨 Exception Queue", "📋 All Transactions", "📜 Audit Trail"])
+    tabs = st.tabs(["⚙ Setup Ruleset", "📊 Dashboard", "🚨 Exception Queue", "📋 All Transactions", "📈 KPI & Savings", "📜 Audit Trail"])
 
     with tabs[0]:
-        tab_dashboard()
+        tab_setup_ruleset()
 
     with tabs[1]:
-        tab_exceptions()
+        tab_dashboard()
 
     with tabs[2]:
-        tab_all_transactions()
+        tab_exceptions()
 
     with tabs[3]:
+        tab_all_transactions()
+
+    with tabs[4]:
+        tab_kpi()
+
+    with tabs[5]:
         tab_audit()
 
 

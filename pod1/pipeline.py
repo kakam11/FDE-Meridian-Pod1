@@ -19,6 +19,7 @@ import anthropic
 import rules
 from data_loader import (
     load_transactions, load_contract, load_prior_exceptions, load_all_documents,
+    load_pm_instructions, load_restricted_docs,
     get_expense_transactions, get_recurring_exceptions_for_project,
     extract_backup_ref, format_transaction, format_prior_resolutions,
 )
@@ -45,6 +46,9 @@ You must perform line-level extraction and output ONLY a valid JSON object — n
 
 CLASSIFY_PROMPT = """## Contract Rules
 {contract}
+
+## PM Instructions & Project Notes
+{pm_instructions}
 
 ## Prior Recurring Resolutions for project {project_id}
 {prior_resolutions}
@@ -155,11 +159,15 @@ def ingest() -> dict:
     all_exceptions = load_prior_exceptions()
     prior_resolutions = get_recurring_exceptions_for_project(all_exceptions, PROJECT_ID)
     all_docs = load_all_documents()
+    pm_instructions = load_pm_instructions()
+    restricted_docs = load_restricted_docs()
     return {
         "expense_txns": expense_txns,
         "contract": contract,
         "prior_resolutions": prior_resolutions,
         "all_docs": all_docs,
+        "pm_instructions": pm_instructions,
+        "restricted_docs": restricted_docs,
     }
 
 
@@ -205,6 +213,7 @@ def classify_transaction(
     doc_content: Optional[str],
     contract: str,
     prior_resolutions: list[dict],
+    pm_instructions: str = "",
 ) -> dict:
     note = tx.get("note", "")
     backup_ref = extract_backup_ref(note)
@@ -226,6 +235,7 @@ def classify_transaction(
 
     prompt = CLASSIFY_PROMPT.format(
         contract=contract[:3500],
+        pm_instructions=pm_instructions[:2000] if pm_instructions else "None on file.",
         project_id=PROJECT_ID,
         prior_resolutions=format_prior_resolutions(prior_resolutions),
         transaction=format_transaction(tx),
@@ -315,6 +325,7 @@ def run_pipeline(progress_callback=None) -> list[dict]:
     contract = data["contract"]
     prior_resolutions = data["prior_resolutions"]
     all_docs = data["all_docs"]
+    pm_instructions = data["pm_instructions"]
 
     results = []
     total = len(expense_txns)
@@ -322,12 +333,12 @@ def run_pipeline(progress_callback=None) -> list[dict]:
     # Agent 2: classify each expense transaction
     for i, tx in enumerate(expense_txns):
         if progress_callback:
-            progress_callback(i, total, f"Classifying {tx['transaction_id']}…")
+            progress_callback(i, total, f"Classifying {tx['transaction_id']}…", "classify")
 
         backup_ref = extract_backup_ref(tx.get("note", ""))
         doc_content = all_docs.get(backup_ref) if backup_ref else None
 
-        result = classify_transaction(tx, doc_content, contract, prior_resolutions)
+        result = classify_transaction(tx, doc_content, contract, prior_resolutions, pm_instructions)
         result["transaction_data"] = tx
         result["processed_at"] = datetime.now(timezone.utc).isoformat()
         result["triage"] = None
@@ -337,7 +348,7 @@ def run_pipeline(progress_callback=None) -> list[dict]:
     flagged = [r for r in results if r.get("classification") in (FLAG, MISSING_DOC)]
     for i, r in enumerate(flagged):
         if progress_callback:
-            progress_callback(total + i, total + len(flagged), f"Triaging {r['transaction_id']}…")
+            progress_callback(i, len(flagged), f"Triaging {r['transaction_id']}…", "triage")
         # Only run triage if no auto_resolution already set by classify agent
         if not r.get("auto_resolution"):
             r["triage"] = triage_exception(r, contract, prior_resolutions)
@@ -394,6 +405,13 @@ def load_decisions() -> list[dict]:
     if DECISIONS_FILE.exists():
         return json.loads(DECISIONS_FILE.read_text())
     return []
+
+
+def clear_decisions():
+    """Remove all analyst decisions and log the reset to the audit trail."""
+    if DECISIONS_FILE.exists():
+        DECISIONS_FILE.unlink()
+    _append_audit("DECISIONS_RESET", {"cleared_by": "supervisor"})
 
 
 def save_decision(transaction_id: str, action: str, reason: str, analyst: str, override: bool = False, adjusted_amount: Optional[float] = None):
