@@ -323,6 +323,94 @@ def rule_lodging_cap(tx: dict, doc_content, contract, prior_resolutions) -> Opti
     )
 
 
+# ── Ruleset pattern matching rule ────────────────────────────────────────────
+
+_KEYWORD_STOP = {
+    "the", "this", "that", "with", "from", "have", "been", "will", "not",
+    "and", "but", "for", "per", "are", "was", "has", "had", "its", "over",
+    "under", "into", "than", "such", "each", "more", "site", "cost", "rate",
+    "date", "item", "type", "code", "name", "amount", "total", "also",
+    "when", "then", "does", "did",
+    # Generic financial/document terms that appear in nearly every transaction or receipt —
+    # keeping them in would cause false positives on every document.
+    "expense", "expenses", "receipt", "receipts", "charge", "charges",
+    "invoice", "invoices", "payment", "payments", "document", "documents",
+    "received", "produced", "applied", "appears", "appearing", "threshold",
+    "billed", "billing", "contract", "project", "client", "standard",
+}
+
+
+def _extract_keywords(text: str) -> list[str]:
+    """Extract meaningful tokens from pattern description or exception type for fuzzy matching."""
+    words = re.findall(r'\b[a-z][a-z]{2,}\b', text.lower())
+    return [w for w in words if w not in _KEYWORD_STOP]
+
+
+def rule_prior_exception_patterns(tx: dict, doc_content, _contract, _prior_resolutions) -> Optional[RuleResult]:
+    """Match transaction against prior exception patterns extracted into ruleset.json by the Setup phase."""
+    rs = _get_ruleset()
+    if not rs:
+        return None
+    patterns = rs.get("prior_exception_patterns", [])
+    if not patterns:
+        return None
+
+    # Build a single text corpus from the transaction (+ doc when available)
+    tx_corpus = " ".join(filter(None, [
+        tx.get("description", ""),
+        tx.get("note", ""),
+        doc_content or "",
+    ])).lower()
+
+    for pattern in patterns:
+        if not pattern.get("recurring"):
+            continue
+        # Skip "no receipt / missing document" patterns when we DO have a backup document —
+        # those scenarios are already handled deterministically by rule_missing_doc /
+        # rule_no_receipt_no_ref before this rule ever runs.
+        exc_type = pattern.get("exception_type", "").upper()
+        if doc_content and any(tok in exc_type for tok in ("MISSING", "NO_RECEIPT", "RECEIPT")):
+            continue
+        raw_text = f"{pattern.get('exception_type', '')} {pattern.get('pattern_description', '')}"
+        keywords = _extract_keywords(raw_text)
+        # Deduplicate while preserving order
+        seen: set[str] = set()
+        unique_kw = [k for k in keywords if not (k in seen or seen.add(k))]  # type: ignore[func-returns-value]
+        # Need at least 2 distinctive keywords to match reliably; 1-keyword patterns
+        # are too generic and produce false positives.
+        if len(unique_kw) < 2:
+            continue
+        matched = [kw for kw in unique_kw if re.search(r'\b' + re.escape(kw) + r'\b', tx_corpus)]
+        # Require at least 2 keyword hits regardless of pattern length
+        if len(matched) < 2:
+            continue
+
+        resolution = pattern.get("resolution", "ESCALATE").upper()
+        action = resolution if resolution in ("APPROVE", "REJECT", "ADJUST", "ESCALATE") else "ESCALATE"
+        classification = EXEMPT if action == "APPROVE" else FLAG
+
+        return RuleResult(
+            classification=classification,
+            confidence=0.82,
+            issues=[
+                f"Matches prior exception pattern {pattern.get('exception_id', '?')}: "
+                f"{pattern.get('pattern_description', raw_text)}"
+            ],
+            auto_resolution={
+                "action": action,
+                "adjusted_amount": None,
+                "reason": pattern.get("reason", "Recurring exception — see prior resolution."),
+                "based_on_prior": pattern.get("exception_id"),
+            },
+            analyst_note=(
+                f"Prior pattern match [{pattern.get('exception_id')}] "
+                f"keywords: {', '.join(matched)}. Claude verifying."
+            ),
+            skip_claude=False,  # Always let Claude verify fuzzy pattern matches
+        )
+    return None
+
+
 # ── Rule registry ────────────────────────────────────────────────────────────
 
 PRE_DOC_RULES = [
@@ -347,6 +435,12 @@ def evaluate(tx: dict, doc_content: Optional[str], contract: str, prior_resoluti
     Run all rules. Returns first RuleResult match or None (escalate to Claude).
     skip_claude=True  → return result directly, no Claude call.
     skip_claude=False → pass result context to Claude, merge findings.
+
+    Order:
+      1. PRE_DOC_RULES  — deterministic, no document needed (per diem, missing doc, etc.)
+      2. POST_DOC_RULES — require doc_content (alcohol, caps, markup, etc.)
+      3. rule_prior_exception_patterns — ruleset-driven fuzzy match; runs last so hardcoded
+         rules always take priority, but extracted patterns still catch residual cases.
     """
     for rule in PRE_DOC_RULES:
         result = rule(tx, doc_content, contract, prior_resolutions)
@@ -357,7 +451,8 @@ def evaluate(tx: dict, doc_content: Optional[str], contract: str, prior_resoluti
             result = rule(tx, doc_content, contract, prior_resolutions)
             if result is not None:
                 return result
-    return None
+    # Pattern matching runs regardless of doc presence — uses whatever corpus is available
+    return rule_prior_exception_patterns(tx, doc_content, contract, prior_resolutions)
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────

@@ -333,7 +333,7 @@ def run_pipeline(progress_callback=None) -> list[dict]:
     # Agent 2: classify each expense transaction
     for i, tx in enumerate(expense_txns):
         if progress_callback:
-            progress_callback(i, total, f"Classifying {tx['transaction_id']}…")
+            progress_callback(i, total, f"Classifying {tx['transaction_id']}…", "classify")
 
         backup_ref = extract_backup_ref(tx.get("note", ""))
         doc_content = all_docs.get(backup_ref) if backup_ref else None
@@ -348,7 +348,7 @@ def run_pipeline(progress_callback=None) -> list[dict]:
     flagged = [r for r in results if r.get("classification") in (FLAG, MISSING_DOC)]
     for i, r in enumerate(flagged):
         if progress_callback:
-            progress_callback(total + i, total + len(flagged), f"Triaging {r['transaction_id']}…")
+            progress_callback(i, len(flagged), f"Triaging {r['transaction_id']}…", "triage")
         # Only run triage if no auto_resolution already set by classify agent
         if not r.get("auto_resolution"):
             r["triage"] = triage_exception(r, contract, prior_resolutions)
@@ -405,6 +405,13 @@ def load_decisions() -> list[dict]:
     if DECISIONS_FILE.exists():
         return json.loads(DECISIONS_FILE.read_text())
     return []
+
+
+def clear_decisions():
+    """Remove all analyst decisions and log the reset to the audit trail."""
+    if DECISIONS_FILE.exists():
+        DECISIONS_FILE.unlink()
+    _append_audit("DECISIONS_RESET", {"cleared_by": "supervisor"})
 
 
 def save_decision(transaction_id: str, action: str, reason: str, analyst: str, override: bool = False, adjusted_amount: Optional[float] = None):
